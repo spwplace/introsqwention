@@ -10,6 +10,7 @@ use candle_core::{DType, Device, IndexOp, Tensor};
 use mistralrs_core::introspection::IntrospectionModel;
 
 use crate::prompts::TRUNCATED_OUTPUTS_JSON;
+use crate::worker::{WorkerCommand, WorkerCoordinator};
 
 // ── ChatML Formatting ───────────────────────────────────────────────
 
@@ -157,6 +158,7 @@ pub fn train_concept_vector(
     num_suffixes: Option<usize>,
     target_layers: Option<&[usize]>,
     progress: Option<ProgressCallback>,
+    coordinator: Option<&WorkerCoordinator>,
 ) -> anyhow::Result<TrainedSteeringVectors> {
     // Parse suffixes
     let mut suffixes: Vec<String> = serde_json::from_str(TRUNCATED_OUTPUTS_JSON)?;
@@ -232,8 +234,22 @@ pub fn train_concept_vector(
         let negative_text = format!("{}{}", negative_prefix, suffix);
 
         // Forward passes with selective layer capture
+        if let Some(coord) = coordinator {
+            let layers_vec: Vec<usize> = capture_set.iter().copied().collect();
+            coord.send_command(&WorkerCommand::ForwardIntrospect {
+                text: positive_text.clone(),
+                layers: Some(layers_vec.clone()),
+            })?;
+        }
         let pos_result =
             model.forward_introspect_layers(&positive_text, Some(capture_set.clone()))?;
+        if let Some(coord) = coordinator {
+            let layers_vec: Vec<usize> = capture_set.iter().copied().collect();
+            coord.send_command(&WorkerCommand::ForwardIntrospect {
+                text: negative_text.clone(),
+                layers: Some(layers_vec),
+            })?;
+        }
         let neg_result =
             model.forward_introspect_layers(&negative_text, Some(capture_set.clone()))?;
 

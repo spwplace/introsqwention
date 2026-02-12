@@ -4,6 +4,8 @@ use std::sync::{Mutex, RwLock};
 use mistralrs_core::introspection::{IntrospectionModel, ModelInfo};
 use serde::{Deserialize, Serialize};
 
+use crate::worker::{WorkerCommand, WorkerCoordinator};
+
 /// Shared state between API handlers and the dashboard.
 pub struct SharedState {
     pub model: Mutex<IntrospectionModel>,
@@ -11,6 +13,18 @@ pub struct SharedState {
     pub experiments: RwLock<HashMap<String, Experiment>>,
     pub steering_vectors: RwLock<HashMap<String, SteeringVectorSet>>,
     pub db_path: std::path::PathBuf,
+    /// Present when running with tensor parallelism (--tp-size > 1).
+    pub worker_coordinator: Option<WorkerCoordinator>,
+}
+
+impl SharedState {
+    /// Send a command to all TP workers (no-op when running single-device).
+    pub fn broadcast(&self, cmd: &WorkerCommand) -> anyhow::Result<()> {
+        if let Some(ref coord) = self.worker_coordinator {
+            coord.send_command(cmd)?;
+        }
+        Ok(())
+    }
 }
 
 // ── Steering Vector Storage ─────────────────────────────────────────

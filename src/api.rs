@@ -15,6 +15,7 @@ use crate::db;
 use crate::experiments;
 use crate::state::*;
 use crate::steering;
+use crate::worker::WorkerCommand;
 
 type AppState = State<Arc<SharedState>>;
 type ApiError = (axum::http::StatusCode, Json<serde_json::Value>);
@@ -116,6 +117,10 @@ pub async fn api_forward(
     let state = state.clone();
     tokio::task::spawn_blocking(move || {
         let top_k = req.top_k.unwrap_or(10);
+        state.broadcast(&WorkerCommand::ForwardIntrospect {
+            text: req.text.clone(),
+            layers: None,
+        }).map_err(|e| err500(e))?;
         let model = state.model.lock().map_err(|e| err500(e))?;
 
         let (token_ids, tokens) = model.tokenize(&req.text).map_err(|e| err500(e))?;
@@ -227,6 +232,14 @@ pub async fn api_set_steering_vector(
             candle_core::Tensor::new(req.vector.as_slice(), device).map_err(|e| err500(e))?;
         let scaled = (&vector * req.scale).map_err(|e| err500(e))?;
 
+        // Broadcast to TP workers: pre-compute scaled vector once
+        let scaled_vec: Vec<f32> = scaled
+            .to_vec1()
+            .map_err(|e| err500(e))?;
+        state.broadcast(&WorkerCommand::SetSteering {
+            vectors: req.layers.iter().map(|&l| (l, scaled_vec.clone())).collect(),
+        }).map_err(|e| err500(e))?;
+
         for &layer in &req.layers {
             if layer >= state.model_info.num_layers {
                 return Err(err400(format!(
@@ -254,6 +267,7 @@ pub async fn api_clear_steering_vectors(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let state = state.clone();
     tokio::task::spawn_blocking(move || {
+        state.broadcast(&WorkerCommand::ClearSteering).map_err(|e| err500(e))?;
         let model = state.model.lock().map_err(|e| err500(e))?;
         model.clear_steering_vectors();
         Ok(Json(serde_json::json!({"status": "ok"})))
@@ -298,6 +312,7 @@ pub async fn api_train(
             req.num_suffixes,
             target_layers,
             progress_cb,
+            state.worker_coordinator.as_ref(),
         );
 
         match result {
@@ -379,6 +394,20 @@ pub async fn api_apply_steering_vector(
                 .ok_or_else(|| err404(format!("steering vector '{}' not found", req.name)))?;
             svec.vectors.clone()
         };
+
+        // Broadcast steering vectors to TP workers
+        let broadcast_vecs: Vec<(usize, Vec<f32>)> = layers.iter()
+            .filter_map(|&layer_idx| {
+                if layer_idx == 0 { return None; }
+                let decoder_idx = layer_idx - 1;
+                svec_vectors.get(&layer_idx).map(|v| {
+                    let scaled: Vec<f32> = v.iter().map(|&x| x * scale as f32).collect();
+                    (decoder_idx, scaled)
+                })
+            })
+            .collect();
+        state.broadcast(&WorkerCommand::SetSteering { vectors: broadcast_vecs })
+            .map_err(|e| err500(e))?;
 
         let model = state.model.lock().map_err(|e| err500(e))?;
         steering::apply_steering_vectors(&model, &svec_vectors, &layers, scale)

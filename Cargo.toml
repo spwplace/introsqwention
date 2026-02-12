@@ -15,6 +15,7 @@ path = "src/cli.rs"
 
 [dependencies]
 mistralrs-core = { path = "mistral-introspect/mistralrs-core" }
+mistralrs-quant = { path = "mistral-introspect/mistralrs-quant" }
 candle-core = "0.9.2"
 candle-nn = "0.9.2"
 rand = "0.9.2"
@@ -33,11 +34,14 @@ indicatif = "0.17"
 futures-core = "0.3"
 async-stream = "0.3"
 rusqlite = { version = "0.34", features = ["bundled"] }
+interprocess = { version = "2.2.3", optional = true }
+serde-big-array = { version = "0.5.1", optional = true }
 
 [features]
 default = []
 metal = ["candle-core/metal", "mistralrs-core/metal"]
 cuda = ["candle-core/cuda", "mistralrs-core/cuda"]
+nccl = ["cuda", "mistralrs-core/nccl", "mistralrs-quant/nccl", "dep:interprocess", "dep:serde-big-array"]
 
 [profile.release]
 opt-level = 3

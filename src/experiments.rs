@@ -10,6 +10,7 @@ use mistralrs_core::introspection::IntrospectionModel;
 use crate::prompts;
 use crate::state::*;
 use crate::steering::{apply_steering_vectors, format_chatml, ChatMessage};
+use crate::worker::WorkerCommand;
 
 /// Build the standard multi-turn detection conversation as ChatML text.
 ///
@@ -60,14 +61,46 @@ fn build_detection_conversation(
 
 /// Ensure steering state is cleared before and after a model operation.
 /// This avoids experiment contamination if the operation fails.
-fn with_clean_steering<R, F>(model: &IntrospectionModel, f: F) -> anyhow::Result<R>
+/// Also broadcasts ClearSteering to TP workers.
+fn with_clean_steering<R, F>(
+    state: &SharedState,
+    model: &IntrospectionModel,
+    f: F,
+) -> anyhow::Result<R>
 where
     F: FnOnce(&IntrospectionModel) -> anyhow::Result<R>,
 {
+    state.broadcast(&WorkerCommand::ClearSteering)?;
     model.clear_steering_vectors();
     let out = f(model);
+    state.broadcast(&WorkerCommand::ClearSteering)?;
     model.clear_steering_vectors();
     out
+}
+
+/// Broadcast a batch of steering vector settings to TP workers.
+///
+/// This mirrors what `apply_steering_vectors` does on the master: converts
+/// introspection layer indices to 0-based decoder indices and packs them
+/// into a single `SetSteering` command for efficient IPC.
+fn broadcast_steering(
+    state: &SharedState,
+    vectors: &HashMap<usize, Vec<f32>>,
+    layers: &[usize],
+    scale: f64,
+) -> anyhow::Result<()> {
+    let mut entries = Vec::new();
+    for &layer_idx in layers {
+        if let Some(vec_data) = vectors.get(&layer_idx) {
+            let decoder_layer_idx = layer_idx.saturating_sub(1);
+            let scaled: Vec<f32> = vec_data.iter().map(|&v| v * scale as f32).collect();
+            entries.push((decoder_layer_idx, scaled));
+        }
+    }
+    if !entries.is_empty() {
+        state.broadcast(&WorkerCommand::SetSteering { vectors: entries })?;
+    }
+    Ok(())
 }
 
 /// Extract softmax probabilities at the last token position from logits tensor.
@@ -295,7 +328,8 @@ pub fn run_logit_diff(
         // Base forward pass (no steering) — single forward, extract yes/no from logits
         let (base_probs, base_p_yes, base_p_no) = {
             let model = state.model.lock().map_err(|e| anyhow::anyhow!("{}", e))?;
-            with_clean_steering(&model, |m| {
+            with_clean_steering(state, &model, |m| {
+                state.broadcast(&WorkerCommand::ForwardIntrospect { text: conversation.clone(), layers: None })?;
                 let result = m.forward_introspect(&conversation)?;
                 let probs = last_token_probs(&result.logits)?;
                 let (p_yes, p_no) = yes_no_probs_from_last_token(m, &probs)?;
@@ -306,8 +340,10 @@ pub fn run_logit_diff(
         // Steered forward pass — single forward
         let (steered_probs, steered_p_yes, steered_p_no) = {
             let model = state.model.lock().map_err(|e| anyhow::anyhow!("{}", e))?;
-            with_clean_steering(&model, |m| {
+            with_clean_steering(state, &model, |m| {
+                broadcast_steering(state, &svec_vectors, layers, scale)?;
                 apply_steering_vectors(m, &svec_vectors, layers, scale)?;
+                state.broadcast(&WorkerCommand::ForwardIntrospect { text: conversation.clone(), layers: None })?;
                 let result = m.forward_introspect(&conversation)?;
                 let probs = last_token_probs(&result.logits)?;
                 let (p_yes, p_no) = yes_no_probs_from_last_token(m, &probs)?;
@@ -318,8 +354,10 @@ pub fn run_logit_diff(
         // Random-direction steering control — single forward
         let (random_p_yes, random_p_no) = {
             let model = state.model.lock().map_err(|e| anyhow::anyhow!("{}", e))?;
-            with_clean_steering(&model, |m| {
+            with_clean_steering(state, &model, |m| {
+                broadcast_steering(state, &random_vectors, layers, scale)?;
                 apply_steering_vectors(m, &random_vectors, layers, scale)?;
+                state.broadcast(&WorkerCommand::ForwardIntrospect { text: conversation.clone(), layers: None })?;
                 let result = m.forward_introspect(&conversation)?;
                 let probs = last_token_probs(&result.logits)?;
                 yes_no_probs_from_last_token(m, &probs)
@@ -447,7 +485,8 @@ pub fn run_control_questions(
         // Base forward pass — single forward, extract yes/no from logits
         let (base_p_yes, base_p_no) = {
             let model = state.model.lock().map_err(|e| anyhow::anyhow!("{}", e))?;
-            with_clean_steering(&model, |m| {
+            with_clean_steering(state, &model, |m| {
+                state.broadcast(&WorkerCommand::ForwardIntrospect { text: conversation.clone(), layers: None })?;
                 let result = m.forward_introspect(&conversation)?;
                 let probs = last_token_probs(&result.logits)?;
                 yes_no_probs_from_last_token(m, &probs)
@@ -457,8 +496,10 @@ pub fn run_control_questions(
         // Steered forward pass — single forward
         let (steered_p_yes, steered_p_no) = {
             let model = state.model.lock().map_err(|e| anyhow::anyhow!("{}", e))?;
-            with_clean_steering(&model, |m| {
+            with_clean_steering(state, &model, |m| {
+                broadcast_steering(state, &svec_vectors, layers, scale)?;
                 apply_steering_vectors(m, &svec_vectors, layers, scale)?;
+                state.broadcast(&WorkerCommand::ForwardIntrospect { text: conversation.clone(), layers: None })?;
                 let result = m.forward_introspect(&conversation)?;
                 let probs = last_token_probs(&result.logits)?;
                 yes_no_probs_from_last_token(m, &probs)
@@ -614,7 +655,8 @@ pub fn run_logit_lens_comparison(
     // Base forward pass with full hidden state capture
     let (base_layers_data, _) = {
         let model = state.model.lock().map_err(|e| anyhow::anyhow!("{}", e))?;
-        with_clean_steering(&model, |m| {
+        with_clean_steering(state, &model, |m| {
+            state.broadcast(&WorkerCommand::ForwardIntrospect { text: conversation.clone(), layers: None })?;
             let result = m.forward_introspect(&conversation)?;
             let lens = m.logit_lens(&result.hidden_states)?;
             build_comparison_layer_data(m, &lens.layer_probs, &tracked_tokens, info)
@@ -624,8 +666,10 @@ pub fn run_logit_lens_comparison(
     // Steered forward pass
     let (steered_layers_data, _) = {
         let model = state.model.lock().map_err(|e| anyhow::anyhow!("{}", e))?;
-        with_clean_steering(&model, |m| {
+        with_clean_steering(state, &model, |m| {
+            broadcast_steering(state, &svec_vectors, layers, scale)?;
             apply_steering_vectors(m, &svec_vectors, layers, scale)?;
+            state.broadcast(&WorkerCommand::ForwardIntrospect { text: conversation.clone(), layers: None })?;
             let result = m.forward_introspect(&conversation)?;
             let lens = m.logit_lens(&result.hidden_states)?;
             build_comparison_layer_data(m, &lens.layer_probs, &tracked_tokens, info)
@@ -705,6 +749,7 @@ pub fn run_layer_type_lens(state: &SharedState, text: &str) -> anyhow::Result<La
 
     let (_hidden_states, layer_probs) = {
         let model = state.model.lock().map_err(|e| anyhow::anyhow!("{}", e))?;
+        state.broadcast(&WorkerCommand::ForwardIntrospect { text: text.to_string(), layers: None })?;
         let result = model.forward_introspect(text)?;
         let lens = model.logit_lens(&result.hidden_states)?;
         (result.hidden_states, lens.layer_probs)
@@ -843,11 +888,15 @@ pub fn run_steering_survival(
         // Set steering at ONLY this one layer
         let hidden_states = {
             let model = state.model.lock().map_err(|e| anyhow::anyhow!("{}", e))?;
-            with_clean_steering(&model, |m| {
+            with_clean_steering(state, &model, |m| {
                 if let Some(direction) = svec_vectors.get(&inj_layer) {
                     let dir_tensor = candle_core::Tensor::new(direction.as_slice(), m.device())?
                         .to_dtype(m.dtype())?;
                     let scaled = (&dir_tensor * scale)?;
+                    let scaled_vec: Vec<f32> = direction.iter().map(|&v| v * scale as f32).collect();
+                    state.broadcast(&WorkerCommand::SetSteering {
+                        vectors: vec![(inj_decoder_idx, scaled_vec)],
+                    })?;
                     m.set_steering_vector(inj_decoder_idx, scaled);
                 } else {
                     anyhow::bail!(
@@ -856,6 +905,7 @@ pub fn run_steering_survival(
                         inj_layer
                     );
                 }
+                state.broadcast(&WorkerCommand::ForwardIntrospect { text: probe_text.to_string(), layers: None })?;
                 let result = m.forward_introspect(probe_text)?;
                 Ok(result.hidden_states)
             })?
@@ -937,6 +987,7 @@ pub fn run_cka(state: &SharedState, texts: &[String]) -> anyhow::Result<CkaResul
 
     for text in texts {
         let model = state.model.lock().map_err(|e| anyhow::anyhow!("{}", e))?;
+        state.broadcast(&WorkerCommand::ForwardIntrospect { text: text.clone(), layers: None })?;
         let result = model.forward_introspect(text)?;
 
         for (layer_idx, hs) in result.hidden_states.iter().enumerate() {
@@ -1074,7 +1125,8 @@ pub fn run_routing_analysis(
     // Base forward with routing capture
     let base_routing = {
         let model = state.model.lock().map_err(|e| anyhow::anyhow!("{}", e))?;
-        with_clean_steering(&model, |m| {
+        with_clean_steering(state, &model, |m| {
+            state.broadcast(&WorkerCommand::ForwardIntrospect { text: text.to_string(), layers: None })?;
             let (_logits, _hs, routing) = m.forward_introspect_with_routing(text)?;
             Ok(routing)
         })?
@@ -1093,8 +1145,10 @@ pub fn run_routing_analysis(
             svec.vectors.clone()
         };
         let model = state.model.lock().map_err(|e| anyhow::anyhow!("{}", e))?;
-        let routing = with_clean_steering(&model, |m| {
+        let routing = with_clean_steering(state, &model, |m| {
+            broadcast_steering(state, &svec_vectors, layers, scale)?;
             apply_steering_vectors(m, &svec_vectors, layers, scale)?;
+            state.broadcast(&WorkerCommand::ForwardIntrospect { text: text.to_string(), layers: None })?;
             let (_logits, _hs, routing) = m.forward_introspect_with_routing(text)?;
             Ok(routing)
         })?;
@@ -1261,8 +1315,11 @@ pub fn run_causal_tracing(
     // Clean forward: capture all hidden states, record top-1 probability
     let (clean_top_token, clean_top_id, clean_prob, clean_hidden) = {
         let model = state.model.lock().map_err(|e| anyhow::anyhow!("{}", e))?;
+        state.broadcast(&WorkerCommand::ClearSteering)?;
         model.clear_steering_vectors();
+        state.broadcast(&WorkerCommand::ClearPatches)?;
         model.clear_patches();
+        state.broadcast(&WorkerCommand::ForwardIntrospect { text: clean_text.to_string(), layers: None })?;
         let result = model.forward_introspect(clean_text)?;
         let probs = last_token_probs(&result.logits)?;
         let (top_id, &top_prob) = probs
@@ -1277,6 +1334,7 @@ pub fn run_causal_tracing(
     // Corrupted forward: measure P(clean_top_token)
     let (corrupted_top_token, corrupted_prob) = {
         let model = state.model.lock().map_err(|e| anyhow::anyhow!("{}", e))?;
+        state.broadcast(&WorkerCommand::ForwardIntrospect { text: corrupted_text.to_string(), layers: None })?;
         let result = model.forward_introspect(corrupted_text)?;
         let probs = last_token_probs(&result.logits)?;
         let corr_prob = probs.get(clean_top_id as usize).copied().unwrap_or(0.0);
@@ -1307,9 +1365,16 @@ pub fn run_causal_tracing(
 
         let patched_prob = {
             let model = state.model.lock().map_err(|e| anyhow::anyhow!("{}", e))?;
+            state.broadcast(&WorkerCommand::ClearPatches)?;
             model.clear_patches();
+            state.broadcast(&WorkerCommand::SetPatch {
+                layer_idx,
+                hidden_state: clean_hidden[capture_idx].flatten_all()?.to_vec1::<f32>()?,
+            })?;
             model.set_patch(layer_idx, clean_hidden[capture_idx].clone());
+            state.broadcast(&WorkerCommand::ForwardIntrospect { text: corrupted_text.to_string(), layers: None })?;
             let result = model.forward_introspect(corrupted_text)?;
+            state.broadcast(&WorkerCommand::ClearPatches)?;
             model.clear_patches();
             let probs = last_token_probs(&result.logits)?;
             probs.get(clean_top_id as usize).copied().unwrap_or(0.0)
@@ -1352,8 +1417,11 @@ pub fn run_gdn_state_stats(state: &SharedState, text: &str) -> anyhow::Result<Gd
     // Forward pass to populate GDN caches
     {
         let model = state.model.lock().map_err(|e| anyhow::anyhow!("{}", e))?;
+        state.broadcast(&WorkerCommand::ClearSteering)?;
         model.clear_steering_vectors();
+        state.broadcast(&WorkerCommand::ClearPatches)?;
         model.clear_patches();
+        state.broadcast(&WorkerCommand::ForwardIntrospect { text: text.to_string(), layers: None })?;
         let _ = model.forward_introspect(text)?;
     }
 
@@ -1602,7 +1670,8 @@ pub fn run_code_logit_diff(
             // Base forward pass
             let (base_probs, base_p_true, base_p_false) = {
                 let model = state.model.lock().map_err(|e| anyhow::anyhow!("{}", e))?;
-                with_clean_steering(&model, |m| {
+                with_clean_steering(state, &model, |m| {
+                    state.broadcast(&WorkerCommand::ForwardIntrospect { text: conversation.clone(), layers: None })?;
                     let result = m.forward_introspect(&conversation)?;
                     let probs = last_token_probs(&result.logits)?;
                     let (pt, pf) = true_false_probs_from_last_token(
@@ -1618,8 +1687,10 @@ pub fn run_code_logit_diff(
             // Steered forward pass
             let (steered_probs, steered_p_true, steered_p_false) = {
                 let model = state.model.lock().map_err(|e| anyhow::anyhow!("{}", e))?;
-                with_clean_steering(&model, |m| {
+                with_clean_steering(state, &model, |m| {
+                    broadcast_steering(state, &svec_vectors, layers, scale)?;
                     apply_steering_vectors(m, &svec_vectors, layers, scale)?;
+                    state.broadcast(&WorkerCommand::ForwardIntrospect { text: conversation.clone(), layers: None })?;
                     let result = m.forward_introspect(&conversation)?;
                     let probs = last_token_probs(&result.logits)?;
                     let (pt, pf) = true_false_probs_from_last_token(
@@ -1635,8 +1706,10 @@ pub fn run_code_logit_diff(
             // Random-direction control
             let (random_p_true, random_p_false) = {
                 let model = state.model.lock().map_err(|e| anyhow::anyhow!("{}", e))?;
-                with_clean_steering(&model, |m| {
+                with_clean_steering(state, &model, |m| {
+                    broadcast_steering(state, &random_vectors, layers, scale)?;
                     apply_steering_vectors(m, &random_vectors, layers, scale)?;
+                    state.broadcast(&WorkerCommand::ForwardIntrospect { text: conversation.clone(), layers: None })?;
                     let result = m.forward_introspect(&conversation)?;
                     let probs = last_token_probs(&result.logits)?;
                     true_false_probs_from_last_token(
@@ -1800,13 +1873,22 @@ pub fn run_code_gen_detection(
                         let model =
                             state.model.lock().map_err(|e| anyhow::anyhow!("{}", e))?;
                         let run = (|| -> anyhow::Result<_> {
+                            state.broadcast(&WorkerCommand::ClearSteering)?;
                             model.clear_steering_vectors();
                             if let Some(vecs) = vectors {
+                                broadcast_steering(state, vecs, layers, scale)?;
                                 apply_steering_vectors(&model, vecs, layers, scale)?;
                             }
                             let top_p = if temperature > 0.0 { Some(0.9) } else { None };
+                            state.broadcast(&WorkerCommand::Generate {
+                                text: conversation.clone(),
+                                max_new_tokens: max_tokens,
+                                temperature,
+                                top_p,
+                            })?;
                             model.generate(&conversation, max_tokens, temperature, top_p)
                         })();
+                        state.broadcast(&WorkerCommand::ClearSteering)?;
                         model.clear_steering_vectors();
                         run.map_err(|e| anyhow::anyhow!("{}", e))?
                     };
@@ -1897,10 +1979,19 @@ pub fn run_concept_identification(
         let gen_result = {
             let model = state.model.lock().map_err(|e| anyhow::anyhow!("{}", e))?;
             let run = (|| -> anyhow::Result<_> {
+                state.broadcast(&WorkerCommand::ClearSteering)?;
                 model.clear_steering_vectors();
+                broadcast_steering(state, &svec_vectors, layers, scale)?;
                 apply_steering_vectors(&model, &svec_vectors, layers, scale)?;
+                state.broadcast(&WorkerCommand::Generate {
+                    text: conversation.clone(),
+                    max_new_tokens: 16,
+                    temperature: 0.0,
+                    top_p: None,
+                })?;
                 model.generate(&conversation, 16, 0.0, None)
             })();
+            state.broadcast(&WorkerCommand::ClearSteering)?;
             model.clear_steering_vectors();
             run.map_err(|e| anyhow::anyhow!("{}", e))?
         };
@@ -1986,12 +2077,21 @@ pub fn run_discrimination_matrix(
             let gen_result = {
                 let model = state.model.lock().map_err(|e| anyhow::anyhow!("{}", e))?;
                 let run = (|| -> anyhow::Result<_> {
+                    state.broadcast(&WorkerCommand::ClearSteering)?;
                     model.clear_steering_vectors();
+                    broadcast_steering(state, &svec_vectors, layers, scale)?;
                     apply_steering_vectors(&model, &svec_vectors, layers, scale)?;
                     let temp = if trial == 0 { 0.0 } else { 0.7 };
                     let top_p = if trial == 0 { None } else { Some(0.9) };
+                    state.broadcast(&WorkerCommand::Generate {
+                        text: conversation.clone(),
+                        max_new_tokens: 16,
+                        temperature: temp,
+                        top_p,
+                    })?;
                     model.generate(&conversation, 16, temp, top_p)
                 })();
+                state.broadcast(&WorkerCommand::ClearSteering)?;
                 model.clear_steering_vectors();
                 run.map_err(|e| anyhow::anyhow!("{}", e))?
             };

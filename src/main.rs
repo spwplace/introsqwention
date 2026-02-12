@@ -1,9 +1,11 @@
 mod api;
 mod db;
+mod distributed;
 mod experiments;
 mod prompts;
 mod state;
 mod steering;
+mod worker;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
@@ -46,6 +48,11 @@ struct Args {
     /// Path to SQLite database for persistence
     #[arg(long, default_value = "data/introsqwention.db")]
     db: PathBuf,
+
+    /// Tensor parallelism world size (number of GPUs).
+    /// Only effective with --features nccl.
+    #[arg(long, default_value = "1")]
+    tp_size: usize,
 }
 
 fn parse_dtype(s: &str) -> Result<DType> {
@@ -57,28 +64,64 @@ fn parse_dtype(s: &str) -> Result<DType> {
     }
 }
 
-fn select_device() -> Result<Device> {
+fn select_device(rank: usize) -> Result<Device> {
     #[cfg(feature = "metal")]
     {
+        let _ = rank;
         tracing::info!("Using Metal device");
         return Ok(Device::new_metal(0)?);
     }
 
     #[cfg(feature = "cuda")]
     {
-        tracing::info!("Using CUDA device 0");
-        return Ok(Device::new_cuda(0)?);
+        tracing::info!("Using CUDA device {rank}");
+        return Ok(Device::new_cuda(rank)?);
     }
 
     #[allow(unreachable_code)]
     {
+        let _ = rank;
         tracing::info!("Using CPU device");
         Ok(Device::Cpu)
     }
 }
 
+// ── Worker entry point (NCCL TP only) ───────────────────────────────
+
+#[cfg(feature = "nccl")]
+fn worker_main() -> Result<()> {
+    // Workers reuse stderr tracing from the spawning env
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?))
+        .with_writer(std::io::stderr)
+        .init();
+
+    let (tp, meta) = distributed::nccl_setup::init_worker()?;
+    let args = Args::parse();
+    let dtype = parse_dtype(&args.dtype)?;
+
+    tracing::info!("Worker rank {} loading model: {}", tp.rank, args.model);
+    let model = mistralrs_core::introspection::IntrospectionModel::load(
+        &args.model,
+        meta.device,
+        dtype,
+        tp.comm,
+    )?;
+
+    tracing::info!("Worker rank {} entering command loop", tp.rank);
+    worker::worker_loop(model)
+}
+
+// ── Master entry point ──────────────────────────────────────────────
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // If we're a TP worker, run the worker path (blocks forever)
+    #[cfg(feature = "nccl")]
+    if distributed::nccl_setup::is_worker() {
+        return worker_main();
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse()?))
         .with_writer(std::io::stderr)
@@ -86,13 +129,39 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     let dtype = parse_dtype(&args.dtype)?;
-    let device = select_device()?;
+
+    // Initialize tensor parallelism (if requested)
+    let tp_config = if args.tp_size > 1 {
+        #[cfg(not(feature = "nccl"))]
+        anyhow::bail!("--tp-size > 1 requires building with --features nccl");
+
+        #[cfg(feature = "nccl")]
+        {
+            let device = select_device(0)?;
+            distributed::nccl_setup::init_master(args.tp_size, &device)?
+        }
+    } else {
+        distributed::TpConfig::single()
+    };
+
+    let device = select_device(tp_config.rank)?;
 
     tracing::info!("Loading model: {}", args.model);
-    let model =
-        mistralrs_core::introspection::IntrospectionModel::load(&args.model, device, dtype)?;
+    let model = mistralrs_core::introspection::IntrospectionModel::load(
+        &args.model,
+        device,
+        dtype,
+        tp_config.comm,
+    )?;
 
     let model_info = model.model_info();
+
+    // Worker coordinator (Some when running TP with multiple ranks)
+    let worker_coordinator = if args.tp_size > 1 {
+        Some(worker::WorkerCoordinator::new(args.tp_size))
+    } else {
+        None
+    };
 
     // Initialize database and load persisted data
     let db_path = args.db.clone();
@@ -119,6 +188,7 @@ async fn main() -> Result<()> {
         experiments: RwLock::new(experiments),
         steering_vectors: RwLock::new(steering_vectors),
         db_path,
+        worker_coordinator,
     });
 
     let static_dir = args.static_dir.clone();
