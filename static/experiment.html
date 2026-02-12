@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Experiment &mdash; Introspect</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=IBM+Plex+Mono:wght@300;400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+    <script src="https://cdn.plot.ly/plotly-2.35.0.min.js"></script>
+    <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+<div data-noise></div>
+
+<header>
+    <div data-header-inner>
+        <div data-header-left>
+            <a href="/" data-back-link>&larr;</a>
+            <div>
+                <h1 id="exp-name">Loading...</h1>
+                <div data-header-meta id="exp-meta"></div>
+            </div>
+        </div>
+        <div data-header-right>
+            <span id="exp-status"></span>
+        </div>
+    </div>
+</header>
+
+<main>
+    <section data-panel id="config-section" style="display:none">
+        <div data-section-header><h2>Configuration</h2></div>
+        <div data-config-prompt>
+            <span data-config-label>Prompt</span>
+            <pre data-config-text id="exp-prompt"></pre>
+        </div>
+    </section>
+
+    <div id="viz-mount"></div>
+
+    <section data-panel id="raw-section" style="display:none">
+        <div data-section-header><h2>Raw Data</h2></div>
+        <details><summary>View JSON</summary><pre data-json id="exp-json"></pre></details>
+    </section>
+</main>
+
+<script src="/js/charts.js"></script>
+<script src="/js/experiment.js"></script>
+</body>
+</html>

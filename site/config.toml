@@ -1,0 +1,9 @@
+base_url = "https://spwplace.github.io/mistral-introspect"
+title = "Introspecting Qwen3-Next"
+description = "Mechanistic Interpretability on a Hybrid Linear Attention / MoE Architecture"
+compile_sass = true
+build_search_index = false
+generate_feeds = false
+
+[markdown]
+highlighting = { theme = "material-theme-ocean" }

@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>Introspect</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=IBM+Plex+Mono:wght@300;400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+    <script src="https://cdn.plot.ly/plotly-2.35.0.min.js"></script>
+    <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+<div data-noise></div>
+
+<header>
+    <div data-header-inner>
+        <div data-header-left>
+            <div data-logo>
+                <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
+                    <circle cx="14" cy="14" r="12" stroke="var(--accent)" stroke-width="1.5" opacity="0.4"/>
+                    <circle cx="14" cy="14" r="7" stroke="var(--accent)" stroke-width="1.5" opacity="0.7"/>
+                    <circle cx="14" cy="14" r="2.5" fill="var(--accent)"/>
+                </svg>
+            </div>
+            <div>
+                <h1>Introspect</h1>
+                <div data-header-meta id="header-meta"></div>
+            </div>
+        </div>
+        <div data-header-right>
+            <div data-endpoint>
+                <span data-endpoint-dot></span>
+                <span>MCP</span>
+                <code id="mcp-endpoint"></code>
+            </div>
+        </div>
+    </div>
+</header>
+
+<main>
+    <section data-component="architecture" id="architecture-section"></section>
+    <div data-two-col>
+        <section data-panel>
+            <div data-section-header>
+                <h2>Steering Vectors</h2>
+                <span data-count id="vec-count">0</span>
+            </div>
+            <table>
+                <thead><tr><th>Name</th><th>Concept</th><th>Layers</th><th>Pairs</th></tr></thead>
+                <tbody id="vec-rows"></tbody>
+            </table>
+        </section>
+        <section data-panel>
+            <div data-section-header>
+                <h2>Experiments</h2>
+                <span data-count id="exp-count">0</span>
+            </div>
+            <table>
+                <thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Type</th><th>Prompt</th></tr></thead>
+                <tbody id="exp-rows"></tbody>
+            </table>
+        </section>
+    </div>
+    <div id="arch-explorer-mount"></div>
+</main>
+
+<script src="/js/dashboard.js"></script>
+</body>
+</html>

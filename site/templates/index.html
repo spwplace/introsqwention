@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+
+{% block title %}{{ config.title }}{% endblock %}
+
+{% block content %}
+<div data-hero>
+    <h1>Introspecting Qwen3-Next</h1>
+    <p data-hero-sub>Mechanistic Interpretability on a Hybrid Linear Attention / MoE Architecture</p>
+    <div data-hero-meta>
+        <span data-tag="model">Qwen3-Coder-Next 0.6B</span>
+        <span data-sep>&middot;</span>
+        <span data-dim>GDN + Full Attention + Sparse MoE</span>
+    </div>
+</div>
+
+<section data-toc>
+    <h2>Contents</h2>
+    <div data-toc-grid>
+        {% set sections = get_section(path="_index.md") %}
+        {% for page in sections.pages %}
+        <a href="{{ page.permalink }}" data-toc-card>
+            <span data-toc-num>{{ loop.index }}</span>
+            <div>
+                <h3>{{ page.title }}</h3>
+                <p>{{ page.description | default(value="") }}</p>
+            </div>
+        </a>
+        {% endfor %}
+    </div>
+</section>
+{% endblock %}

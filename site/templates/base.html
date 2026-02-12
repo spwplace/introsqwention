@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}{{ config.title }}{% endblock %}</title>
+    <meta name="description" content="{{ config.description }}">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=IBM+Plex+Mono:wght@300;400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+    <script src="https://cdn.plot.ly/plotly-2.35.0.min.js"></script>
+    <link rel="stylesheet" href="{{ get_url(path='style.css') }}">
+    {% block head %}{% endblock %}
+</head>
+<body>
+<div data-noise></div>
+
+<nav>
+    <div data-nav-inner>
+        <a href="{{ get_url(path='/') }}" data-nav-home>
+            <svg width="22" height="22" viewBox="0 0 28 28" fill="none">
+                <circle cx="14" cy="14" r="12" stroke="var(--accent)" stroke-width="1.5" opacity="0.4"/>
+                <circle cx="14" cy="14" r="7" stroke="var(--accent)" stroke-width="1.5" opacity="0.7"/>
+                <circle cx="14" cy="14" r="2.5" fill="var(--accent)"/>
+            </svg>
+            <span>Introspecting Qwen3-Next</span>
+        </a>
+        <div data-nav-links>
+            {% set sections = get_section(path="_index.md") %}
+            {% for page in sections.pages %}
+            <a href="{{ page.permalink }}" {% if current_path == page.path %}data-active{% endif %}>{{ page.title }}</a>
+            {% endfor %}
+        </div>
+    </div>
+</nav>
+
+<main>
+    {% block content %}{% endblock %}
+</main>
+
+<footer>
+    <div data-footer-inner>
+        <span data-dim>Mechanistic interpretability research on Qwen3-Next</span>
+        <span data-dim>&middot;</span>
+        <a href="https://github.com/spwplace/mistral-introspect" data-footer-link>GitHub</a>
+    </div>
+</footer>
+
+<script src="{{ get_url(path='js/charts.js') }}"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>
